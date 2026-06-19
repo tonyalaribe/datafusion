@@ -1143,12 +1143,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 }
                 let update_from = from_clauses.and_then(|mut f| f.pop());
 
-                // UPDATE ... FROM is currently not working
-                // TODO fix https://github.com/apache/datafusion/issues/19950
-                if update_from.is_some() {
-                    return not_impl_err!("UPDATE ... FROM is not supported");
-                }
-
+                // TimeFusion patch: removed the defensive `UPDATE ... FROM is not
+                // supported` guard so the FROM clause reaches `update_to_plan` and
+                // TimeFusion's DmlQueryPlanner can lower it (Delta MergeBuilder /
+                // MemBuffer hash-join). Mirrors apache/datafusion#21530; drop once
+                // upstream merges #19950.
                 if returning.is_some() {
                     plan_err!("Update-returning clause not yet supported")?;
                 }
