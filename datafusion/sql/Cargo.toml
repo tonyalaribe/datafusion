@@ -54,9 +54,12 @@ recursive_protection = ["dep:recursive"]
 arrow = { workspace = true }
 bigdecimal = { workspace = true }
 chrono = { workspace = true }
-datafusion-common = { workspace = true, features = ["sql"] }
-datafusion-expr = { workspace = true, features = ["sql"] }
-datafusion-functions-nested = { workspace = true, features = ["sql"] }
+# TimeFusion: depend on the published 54.0.0 siblings (not workspace path) so this
+# crate can be consumed as a single `[patch.crates-io]` git dep without dragging a
+# duplicate datafusion-expr/common out of the monorepo workspace.
+datafusion-common = { version = "54.0.0", features = ["sql"], default-features = false }
+datafusion-expr = { version = "54.0.0", features = ["sql"], default-features = false }
+datafusion-functions-nested = { version = "54.0.0", features = ["sql"], default-features = false }
 indexmap = { workspace = true }
 log = { workspace = true }
 recursive = { workspace = true, optional = true }
