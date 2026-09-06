@@ -45,9 +45,9 @@ use crate::{
     logical_expr::ScalarUDF,
     logical_expr::{
         CreateCatalog, CreateCatalogSchema, CreateExternalTable, CreateFunction,
-        CreateMemoryTable, CreateView, DropCatalogSchema, DropFunction, DropTable,
-        DropView, Execute, LogicalPlan, LogicalPlanBuilder, Prepare, ResetVariable,
-        SetVariable, TableType, UNNAMED_TABLE,
+        CreateMemoryTable, CreateView, Deallocate, DropCatalogSchema, DropFunction,
+        DropTable, DropView, Execute, LogicalPlan, LogicalPlanBuilder, Prepare,
+        ResetVariable, SetVariable, TableType, UNNAMED_TABLE,
     },
     physical_expr::PhysicalExpr,
     physical_plan::ExecutionPlan,
@@ -766,9 +766,12 @@ impl SessionContext {
                 self.execute_prepared(execute)
             }
             LogicalPlan::Statement(Statement::Deallocate(deallocate)) => {
-                self.state
-                    .write()
-                    .remove_prepared(deallocate.name.as_str())?;
+                match deallocate {
+                    Deallocate::Named(name) => {
+                        self.state.write().remove_prepared(&name)?
+                    }
+                    Deallocate::All => self.state.write().clear_prepared(),
+                }
                 self.return_empty_dataframe()
             }
             plan => Ok(DataFrame::new(self.state(), plan)),

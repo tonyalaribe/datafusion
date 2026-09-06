@@ -1013,6 +1013,11 @@ impl SessionState {
             None => exec_err!("Prepared statement '{}' does not exist", name),
         }
     }
+
+    /// Remove all prepared plans without changing any other session state.
+    pub(crate) fn clear_prepared(&mut self) {
+        self.prepared_plans.clear();
+    }
 }
 
 /// A builder to be used for building [`SessionState`]'s. Defaults will

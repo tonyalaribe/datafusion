@@ -135,8 +135,11 @@ impl Statement {
                             expr_vec_fmt!(parameters)
                         )
                     }
-                    Statement::Deallocate(Deallocate { name }) => {
+                    Statement::Deallocate(Deallocate::Named(name)) => {
                         write!(f, "Deallocate: {name}")
+                    }
+                    Statement::Deallocate(Deallocate::All) => {
+                        write!(f, "Deallocate: ALL")
                     }
                 }
             }
@@ -224,9 +227,11 @@ pub struct Execute {
     pub parameters: Vec<Expr>,
 }
 
-/// Deallocate a prepared statement.
+/// Deallocate one named prepared statement or every prepared statement.
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Hash)]
-pub struct Deallocate {
-    /// The name of the prepared statement to deallocate
-    pub name: String,
+pub enum Deallocate {
+    /// Deallocate the prepared statement with this name.
+    Named(String),
+    /// Deallocate every prepared statement in the session.
+    All,
 }

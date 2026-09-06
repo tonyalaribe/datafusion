@@ -906,8 +906,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 // Similar to PostgreSQL, the PREPARE keyword is ignored
                 prepare: _,
             } => Ok(LogicalPlan::Statement(PlanStatement::Deallocate(
-                Deallocate {
-                    name: ident_to_string(&name),
+                if name.quote_style.is_none() && name.value.eq_ignore_ascii_case("all") {
+                    Deallocate::All
+                } else {
+                    Deallocate::Named(ident_to_string(&name))
                 },
             ))),
 

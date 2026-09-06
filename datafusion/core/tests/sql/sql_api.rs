@@ -223,3 +223,30 @@ async fn invalid_wrapped_negation_fails_during_optimization() {
         "Negation only supports numeric, interval and timestamp types"
     );
 }
+
+#[tokio::test]
+async fn deallocate_all_preserves_session_state_and_quoted_names() {
+    let ctx = SessionContext::new();
+    let peer = SessionContext::new();
+    peer.sql("PREPARE kept AS SELECT 1").await.unwrap();
+    for sql in [
+        "SET datafusion.execution.batch_size = 17",
+        "PREPARE kept AS SELECT 1",
+        r#"PREPARE "all" AS SELECT 2"#,
+        r#"DEALLOCATE "all""#,
+        "EXECUTE kept",
+        r#"PREPARE "all" AS SELECT 2"#,
+        "DEALLOCATE ALL",
+        "DEALLOCATE PREPARE ALL",
+    ] {
+        ctx.sql(sql).await.unwrap();
+    }
+    for sql in ["EXECUTE kept", r#"EXECUTE "all""#] {
+        assert_contains!(
+            ctx.sql(sql).await.unwrap_err().to_string(),
+            "does not exist"
+        );
+    }
+    assert_eq!(ctx.state().config().batch_size(), 17);
+    peer.sql("EXECUTE kept").await.unwrap();
+}
