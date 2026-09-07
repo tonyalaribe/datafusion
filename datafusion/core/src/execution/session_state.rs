@@ -1939,6 +1939,10 @@ struct SessionContextProvider<'a> {
 
 #[cfg(feature = "sql")]
 impl ContextProvider for SessionContextProvider<'_> {
+    fn supports_update_from(&self) -> bool {
+        self.state.query_planner.supports_update_from()
+    }
+
     fn get_expr_planners(&self) -> &[Arc<dyn ExprPlanner>] {
         self.state.expr_planners()
     }

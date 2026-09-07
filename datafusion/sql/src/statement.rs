@@ -1145,12 +1145,12 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 }
                 let update_from = from_clauses.and_then(|mut f| f.pop());
 
-                // UPDATE ... FROM is currently not working
-                // TODO fix https://github.com/apache/datafusion/issues/19950
-                if update_from.is_some() {
+                // The default physical planner drops source-side predicates.
+                // Custom DML planners must explicitly implement the joined input.
+                if update_from.is_some() && !self.context_provider.supports_update_from()
+                {
                     return not_impl_err!("UPDATE ... FROM is not supported");
                 }
-
                 if returning.is_some() {
                     plan_err!("Update-returning clause not yet supported")?;
                 }

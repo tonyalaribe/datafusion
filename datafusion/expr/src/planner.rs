@@ -42,6 +42,12 @@ use sqlparser::ast::{Expr as SQLExpr, Ident, ObjectName, TableAlias, TableFactor
 ///
 /// [`TableProvider`]: https://docs.rs/datafusion/latest/datafusion/catalog/trait.TableProvider.html
 pub trait ContextProvider {
+    /// Whether the execution planner handles the joined input of `UPDATE ... FROM`.
+    /// The default planner cannot preserve its source predicates and rejects it.
+    fn supports_update_from(&self) -> bool {
+        false
+    }
+
     /// Returns a table by reference, if it exists
     fn get_table_source(&self, name: TableReference) -> Result<Arc<dyn TableSource>>;
 
