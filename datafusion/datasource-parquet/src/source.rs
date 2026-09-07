@@ -297,6 +297,8 @@ pub struct ParquetSource {
     /// Sort order driving `PreparedAccessPlan::reorder_by_statistics`
     /// in the opener.
     sort_order_for_reorder: Option<LexOrdering>,
+    /// Whether files may be split into byte ranges for parallel scans.
+    allow_repartitioning: bool,
 }
 
 impl ParquetSource {
@@ -323,7 +325,19 @@ impl ParquetSource {
             encryption_factory: None,
             reverse_row_groups: false,
             sort_order_for_reorder: None,
+            allow_repartitioning: true,
         }
+    }
+
+    /// Control whether this source supports splitting files into byte ranges.
+    ///
+    /// Disable this when a consumer assigns physical row positions from the
+    /// scan stream. Combining independently scanned ranges does not preserve
+    /// their original row order. This does not disable scanning separate files
+    /// in parallel or change predicate pushdown behavior.
+    pub fn with_repartitioning(mut self, allow_repartitioning: bool) -> Self {
+        self.allow_repartitioning = allow_repartitioning;
+        self
     }
 
     /// Set the `TableParquetOptions` for this ParquetSource.
@@ -528,6 +542,10 @@ impl From<ParquetSource> for Arc<dyn FileSource> {
 }
 
 impl FileSource for ParquetSource {
+    fn supports_repartitioning(&self) -> bool {
+        self.allow_repartitioning
+    }
+
     fn create_file_opener(
         &self,
         _object_store: Arc<dyn ObjectStore>,
