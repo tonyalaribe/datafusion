@@ -46,7 +46,7 @@ use crate::spill::get_record_batch_memory_size;
 use crate::spill::in_progress_spill_file::InProgressSpillFile;
 use crate::spill::spill_manager::{GetSlicedSize, SpillManager};
 use crate::stream::RecordBatchStreamAdapter;
-use crate::stream::ReservationStream;
+use crate::stream::ReservedBatchesStream;
 use crate::topk::TopK;
 use crate::topk::TopKDynamicFilters;
 use crate::{
@@ -670,42 +670,31 @@ impl ExternalSorter {
         let batch_size = self.batch_size;
         let output_row_metrics = metrics.output_rows().clone();
 
-        let stream = futures::stream::once(async move {
-            let schema = batch.schema();
+        let stream =
+            futures::stream::once(async move {
+                let schema = batch.schema();
 
-            // Sort the batch immediately and get all output batches
-            let sorted_batches = sort_batch_chunked(&batch, &expressions, batch_size)?;
+                // Sort the batch immediately and get all output batches
+                let sorted_batches =
+                    sort_batch_chunked(&batch, &expressions, batch_size)?;
 
-            // Resize the reservation to match the actual sorted output size.
-            // Using try_resize avoids a release-then-reacquire cycle, which
-            // matters for MemoryPool implementations where grow/shrink have
-            // non-trivial cost (e.g. JNI calls in Comet).
-            let total_sorted_size: usize = sorted_batches
-                .iter()
-                .map(get_record_batch_memory_size)
-                .sum();
-            reservation
-                .try_resize(total_sorted_size)
-                .map_err(Self::err_with_oom_context)?;
-
-            // Wrap in ReservationStream to hold the reservation
-            Result::<_, DataFusionError>::Ok(Box::pin(ReservationStream::new(
-                Arc::clone(&schema),
-                Box::pin(RecordBatchStreamAdapter::new(
-                    Arc::clone(&schema),
-                    futures::stream::iter(sorted_batches.into_iter().map(Ok)),
-                )),
-                reservation,
-            )) as SendableRecordBatchStream)
-        })
-        .try_flatten()
-        .map(move |batch| match batch {
-            Ok(batch) => {
-                output_row_metrics.add(batch.num_rows());
-                Ok(batch)
-            }
-            Err(e) => Err(e),
-        });
+                // Sliced and view arrays may share buffers across output batches.
+                // Reserve each buffer once and retain it until its last queued use.
+                let stream =
+                    ReservedBatchesStream::try_new(schema, sorted_batches, reservation)
+                        .map_err(Self::err_with_oom_context)?;
+                Result::<_, DataFusionError>::Ok(
+                    Box::pin(stream) as SendableRecordBatchStream
+                )
+            })
+            .try_flatten()
+            .map(move |batch| match batch {
+                Ok(batch) => {
+                    output_row_metrics.add(batch.num_rows());
+                    Ok(batch)
+                }
+                Err(e) => Err(e),
+            });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
@@ -1454,6 +1443,73 @@ mod tests {
 
     use futures::{FutureExt, Stream, TryStreamExt};
     use insta::assert_snapshot;
+
+    #[tokio::test]
+    async fn sort_shared_view_buffers_fit_and_release() -> Result<()> {
+        for consume_batches in [1, 8] {
+            let rows = 8192;
+            let body = StringViewArray::from_iter_values(
+                (0..rows).map(|i| format!("{i:08}{}", "x".repeat(1016))),
+            );
+            let shared_bytes: usize =
+                body.data_buffers().iter().map(|b| b.capacity()).sum();
+            let ids = Int64Array::from_iter_values((0..rows).map(|i| (i * 4051) % rows));
+            let batch = RecordBatch::try_from_iter(vec![
+                ("id", Arc::new(ids) as ArrayRef),
+                ("body", Arc::new(body) as ArrayRef),
+            ])?;
+            let pool: Arc<dyn MemoryPool> = Arc::new(
+                datafusion_execution::memory_pool::FairSpillPool::new(24 * 1024 * 1024),
+            );
+            let runtime = RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::clone(&pool))
+                .build_arc()?;
+            let metrics = ExecutionPlanMetricsSet::new();
+            let mut sorter = ExternalSorter::new(
+                0,
+                batch.schema(),
+                [PhysicalSortExpr::new_default(Arc::new(Column::new(
+                    "id", 0,
+                )))]
+                .into(),
+                1024,
+                1024 * 1024,
+                usize::MAX,
+                SpillCompression::Uncompressed,
+                &metrics,
+                runtime,
+            )?;
+            sorter.insert_batch(batch).await?;
+            assert!(!sorter.spilled_before());
+            let mut stream = sorter.sort().await?;
+            let mut expected = 0;
+            for _ in 0..consume_batches {
+                let batch = stream.next().await.unwrap()?;
+                for id in batch.column(0).as_primitive::<Int64Type>().values() {
+                    assert_eq!(*id, expected);
+                    expected += 1;
+                }
+                assert!(pool.reserved() <= 24 * 1024 * 1024);
+                if expected < rows {
+                    assert!(
+                        pool.reserved() >= shared_bytes,
+                        "remaining batches still own the shared buffers"
+                    );
+                }
+            }
+            if consume_batches == 8 {
+                assert_eq!(expected, rows);
+                assert!(stream.next().await.is_none());
+            }
+            drop(stream);
+            assert_eq!(
+                pool.reserved(),
+                0,
+                "completion and cancellation release buffers"
+            );
+        }
+        Ok(())
+    }
 
     #[derive(Debug, Clone)]
     pub struct SortedUnboundedExec {
