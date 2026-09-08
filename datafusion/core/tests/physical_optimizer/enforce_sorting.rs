@@ -2453,6 +2453,24 @@ async fn test_replace_with_partial_sort2() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_order_preservation_does_not_require_sort_pushdown() -> Result<()> {
+    let schema = create_test_schema3()?;
+    let input = RequirementsTestExec::new(memory_exec(&schema))
+        .with_maintains_input_order(true)
+        .with_supports_sort_pushdown(false)
+        .into_arc();
+    let plan = sort_exec([sort_expr("a", &schema)].into(), input);
+    let test = EnforceSortingTest::new(plan).with_repartition_sorts(true);
+    assert_snapshot!(test.run(), @r"
+    Input / Optimized Plan:
+    SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
+      RequiredInputOrderingExec
+        DataSourceExec: partitions=1, partition_sizes=[0]
+    ");
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_push_with_required_input_ordering_prohibited() -> Result<()> {
     let schema = create_test_schema3()?;
     let ordering_a: LexOrdering = [sort_expr("a", &schema)].into();

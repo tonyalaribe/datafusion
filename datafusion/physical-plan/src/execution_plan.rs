@@ -200,6 +200,20 @@ pub trait ExecutionPlan: Any + Debug + DisplayAs + Send + Sync {
         vec![false; self.children().len()]
     }
 
+    /// Whether the sort optimizer may push a requested ordering to this
+    /// node's children, subject to the other ordering requirements.
+    ///
+    /// This is separate from [`Self::maintains_input_order`]: a node can emit
+    /// surviving rows in input order while using their physical positions to
+    /// compute values or filter rows. Such a node must return `false`, because
+    /// sorting its input can change its result.
+    ///
+    /// The default is `true` for compatibility; returning `true` does not
+    /// override the optimizer's other checks or guarantee sort pushdown.
+    fn supports_sort_pushdown(&self) -> bool {
+        true
+    }
+
     /// Specifies whether the `ExecutionPlan` benefits from increased
     /// parallelization at its input for each child.
     ///
