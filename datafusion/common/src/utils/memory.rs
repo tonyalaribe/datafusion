@@ -144,6 +144,27 @@ pub fn get_record_batch_memory_size(batch: &RecordBatch) -> usize {
     total_size
 }
 
+/// Memory released by each batch when consuming `batches` in order.
+///
+/// Shared buffers are charged to the last batch that references them. The sum
+/// is the physical buffer footprint of all batches, and each suffix sum is the
+/// footprint of the corresponding remaining batches. As with
+/// [`get_record_batch_memory_size`], metadata is not included.
+pub fn get_record_batch_memory_releases(batches: &[RecordBatch]) -> Vec<usize> {
+    let mut counted_buffers = HashSet::new();
+    let mut releases = vec![0; batches.len()];
+    for (batch, released) in batches.iter().zip(&mut releases).rev() {
+        for array in batch.columns() {
+            count_array_data_memory_size(
+                &array.to_data(),
+                &mut counted_buffers,
+                released,
+            );
+        }
+    }
+    releases
+}
+
 /// Count the memory usage of `array_data` and its children recursively.
 fn count_array_data_memory_size(
     array_data: &ArrayData,
@@ -209,6 +230,32 @@ mod record_batch_tests {
     use arrow::array::{Float64Array, Int32Array, ListArray};
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use std::sync::Arc;
+
+    #[test]
+    fn shared_batch_releases_match_each_remaining_suffix() {
+        let array = Arc::new(Int32Array::from(vec![Some(1), None, Some(3), Some(4)]));
+        let batch =
+            RecordBatch::try_from_iter(vec![("a", array as arrow::array::ArrayRef)])
+                .unwrap();
+        let batches = vec![batch.slice(0, 2), batch.slice(1, 2), batch.slice(2, 2)];
+        let releases = get_record_batch_memory_releases(&batches);
+        // The final slice has no nulls, so Arrow removes its null bitmap.
+        // Retain that bitmap through the middle slice, and values through the last.
+        let data = batch.column(0).to_data();
+        assert_eq!(
+            releases,
+            vec![
+                0,
+                data.nulls().unwrap().inner().inner().capacity(),
+                data.buffers()[0].capacity()
+            ]
+        );
+        assert_eq!(
+            releases.iter().sum::<usize>(),
+            get_record_batch_memory_size(&batch)
+        );
+        assert!(get_record_batch_memory_releases(&[]).is_empty());
+    }
 
     #[test]
     fn test_get_record_batch_memory_size() {
