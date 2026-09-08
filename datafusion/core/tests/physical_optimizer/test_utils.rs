@@ -397,6 +397,7 @@ pub fn projection_exec(
 pub struct RequirementsTestExec {
     required_input_ordering: Option<LexOrdering>,
     maintains_input_order: bool,
+    supports_sort_pushdown: bool,
     input: Arc<dyn ExecutionPlan>,
 }
 
@@ -405,6 +406,7 @@ impl RequirementsTestExec {
         Self {
             required_input_ordering: None,
             maintains_input_order: true,
+            supports_sort_pushdown: true,
             input,
         }
     }
@@ -421,6 +423,12 @@ impl RequirementsTestExec {
     /// set the maintains_input_order flag
     pub fn with_maintains_input_order(mut self, maintains_input_order: bool) -> Self {
         self.maintains_input_order = maintains_input_order;
+        self
+    }
+
+    /// Set whether sort requirements may move below this node.
+    pub fn with_supports_sort_pushdown(mut self, supported: bool) -> Self {
+        self.supports_sort_pushdown = supported;
         self
     }
 
@@ -465,6 +473,10 @@ impl ExecutionPlan for RequirementsTestExec {
         vec![self.maintains_input_order]
     }
 
+    fn supports_sort_pushdown(&self) -> bool {
+        self.supports_sort_pushdown
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
     }
@@ -477,6 +489,7 @@ impl ExecutionPlan for RequirementsTestExec {
         Ok(RequirementsTestExec::new(Arc::clone(&children[0]))
             .with_required_input_ordering(self.required_input_ordering.clone())
             .with_maintains_input_order(self.maintains_input_order)
+            .with_supports_sort_pushdown(self.supports_sort_pushdown)
             .into_arc())
     }
 

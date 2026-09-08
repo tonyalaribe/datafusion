@@ -221,6 +221,9 @@ fn pushdown_requirement_to_children(
     parent_required: OrderingRequirements,
     parent_fetch: Option<usize>,
 ) -> Result<Option<Vec<Option<OrderingRequirements>>>> {
+    if !plan.supports_sort_pushdown() {
+        return Ok(None);
+    }
     // If there is a limit on the parent plan we cannot push it down through operators that change the cardinality.
     // E.g. consider if LIMIT 2 is applied below a FilteExec that filters out 1/2 of the rows we'll end up with 1 row instead of 2.
     // If the LIMIT is applied after the FilterExec and the FilterExec returns > 2 rows we'll end up with 2 rows (correct).
