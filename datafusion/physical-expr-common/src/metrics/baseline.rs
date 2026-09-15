@@ -20,7 +20,7 @@
 use std::{borrow::Cow, collections::BTreeMap, sync::Arc, task::Poll};
 
 use arrow::record_batch::RecordBatch;
-use datafusion_common::{Result, utils::memory::get_record_batch_memory_size};
+use datafusion_common::Result;
 
 use super::{
     Count, ExecutionPlanMetricsSet, Metric, MetricBuilder, MetricsSet, Time, Timestamp,
@@ -331,7 +331,16 @@ impl RecordOutput for usize {
 impl RecordOutput for RecordBatch {
     fn record_output(self, bm: &BaselineMetrics) -> Self {
         bm.record_output(self.num_rows());
-        let n_bytes = get_record_batch_memory_size(&self);
+        // `get_array_memory_size` instead of `get_record_batch_memory_size`:
+        // the latter calls `to_data()` on every column (an ArrayData rebuild)
+        // and dedups buffer pointers through a SipHash HashSet, per batch per
+        // operator. Profiled on a production workload with 93-column batches
+        // it was one of the largest single CPU line items in the whole
+        // process — for a metric. The arrow accessor reads the existing
+        // buffers with no rebuild and no hashing; it can over-count buffers
+        // shared between columns, which is acceptable for `output_bytes`.
+        // Memory ACCOUNTING (spill reservations) still uses the exact walk.
+        let n_bytes = self.get_array_memory_size();
         bm.output_bytes.add(n_bytes);
         bm.output_batches.add(1);
         self
@@ -341,7 +350,8 @@ impl RecordOutput for RecordBatch {
 impl RecordOutput for &RecordBatch {
     fn record_output(self, bm: &BaselineMetrics) -> Self {
         bm.record_output(self.num_rows());
-        let n_bytes = get_record_batch_memory_size(self);
+        // See `RecordOutput for RecordBatch` above.
+        let n_bytes = self.get_array_memory_size();
         bm.output_bytes.add(n_bytes);
         bm.output_batches.add(1);
         self
