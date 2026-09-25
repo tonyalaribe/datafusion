@@ -80,7 +80,8 @@ const SPILL_BATCH_MEMORY_MARGIN: usize = 4096;
 
 /// When we poll for the next batch, we will get back both the batch and the reader,
 /// so we can call `next` again.
-type NextRecordBatchResult = Result<(StreamReader<BufReader<File>>, Option<RecordBatch>)>;
+type SpillReader = (StreamReader<BufReader<File>>, RefCountedTempFile);
+type NextRecordBatchResult = Result<(Box<SpillReader>, Option<RecordBatch>)>;
 
 enum SpillReaderStreamState {
     /// Initial state: the stream was not initialized yet
@@ -91,7 +92,7 @@ enum SpillReaderStreamState {
     ReadInProgress(SpawnedTask<NextRecordBatchResult>),
 
     /// A read has finished and we wait for being polled again in order to start reading the next batch.
-    Waiting(StreamReader<BufReader<File>>),
+    Waiting(Box<SpillReader>),
 
     /// The stream has finished, successfully or not.
     Done,
@@ -150,7 +151,8 @@ impl SpillReaderStream {
                     // Add a SpillManager UID to IPC metadata and validate it here as well.
                     let next_batch = reader.next().transpose()?;
 
-                    Ok((reader, next_batch))
+                    // Allocate once per file, then move the reader and its disk charge together.
+                    Ok((Box::new((reader, spill_file)), next_batch))
                 });
 
                 self.state = SpillReaderStreamState::ReadInProgress(task);
@@ -214,7 +216,7 @@ impl SpillReaderStream {
                 };
 
                 let task = SpawnedTask::spawn_blocking(move || {
-                    let next_batch = reader.next().transpose()?;
+                    let next_batch = reader.0.next().transpose()?;
 
                     Ok((reader, next_batch))
                 });
@@ -561,6 +563,203 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use datafusion_execution::runtime_env::RuntimeEnv;
     use futures::StreamExt as _;
+
+    #[tokio::test]
+    async fn spill_reader_retains_disk_charge_until_closed() -> Result<()> {
+        enum Finish {
+            Cancel,
+            Eof,
+            SchemaMismatch,
+        }
+        let batch = RecordBatch::try_from_iter([(
+            "id",
+            Arc::new(Int32Array::from_iter_values(0..256)) as ArrayRef,
+        )])?;
+        let env = Arc::new(RuntimeEnv::default());
+        let manager = SpillManager::new(
+            Arc::clone(&env),
+            SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+            batch.schema(),
+        );
+        let mismatched = SpillManager::new(
+            Arc::clone(&env),
+            SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+            Arc::new(Schema::empty()),
+        );
+        for finish in [Finish::Cancel, Finish::Eof, Finish::SchemaMismatch] {
+            let file = manager
+                .spill_record_batch_and_finish(
+                    &[batch.clone(), batch.clone()],
+                    "reader lifetime",
+                )?
+                .expect("nonempty input");
+            let path = file.path().to_owned();
+            let bytes = env.disk_manager.used_disk_space();
+            assert!(bytes > 0);
+            let reader = if matches!(finish, Finish::SchemaMismatch) {
+                &mismatched
+            } else {
+                &manager
+            };
+            let mut stream = reader.read_spill_as_stream_unbuffered(file, None)?;
+            if matches!(finish, Finish::SchemaMismatch) {
+                let error = stream.next().await.expect("schema mismatch must fail");
+                assert!(
+                    matches!(error, Err(DataFusionError::Execution(message)) if message.starts_with("Spill file schema mismatch:"))
+                );
+                assert_eq!(env.disk_manager.used_disk_space(), 0);
+                assert!(
+                    !path.exists(),
+                    "read error must close the file before stream drop"
+                );
+                assert!(
+                    stream.next().await.is_none(),
+                    "read error must terminate the stream"
+                );
+                continue;
+            }
+            assert_eq!(stream.next().await.transpose()?, Some(batch.clone()));
+            assert_eq!(env.disk_manager.used_disk_space(), bytes);
+            assert!(path.exists(), "the open reader must own the spill file");
+            if matches!(finish, Finish::Eof) {
+                assert_eq!(stream.next().await.transpose()?, Some(batch.clone()));
+                assert_eq!(env.disk_manager.used_disk_space(), bytes);
+                assert!(stream.next().await.is_none());
+                assert_eq!(env.disk_manager.used_disk_space(), 0);
+                assert!(!path.exists(), "EOF must close the file before stream drop");
+            }
+            drop(stream);
+            assert_eq!(env.disk_manager.used_disk_space(), 0);
+            assert!(
+                !path.exists(),
+                "completion and cancellation must delete the spill file"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_active_spill_read_retains_disk_charge() -> Result<()> {
+        use std::io::Write;
+
+        let batch = RecordBatch::try_from_iter([(
+            "id",
+            Arc::new(Int32Array::from_iter_values(0..16)) as ArrayRef,
+        )])?;
+        let env = Arc::new(RuntimeEnv::default());
+        let manager = SpillManager::new(
+            Arc::clone(&env),
+            SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+            batch.schema(),
+        );
+        let file = manager
+            .spill_record_batch_and_finish(&[batch], "active cancellation")?
+            .expect("nonempty input");
+        let path = file.path().to_owned();
+        let ipc = std::fs::read(&path)?;
+        let bytes = env.disk_manager.used_disk_space();
+        // A real FIFO makes File::open/read block without a production test hook.
+        // Only this test's temporary path is replaced; its tracked owner stays live.
+        std::fs::remove_file(&path)?;
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()?
+                .success()
+        );
+        let (connected, ready) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let writer_path = path.clone();
+        let writer = SpawnedTask::spawn_blocking(move || -> std::io::Result<()> {
+            let mut output = std::fs::OpenOptions::new().write(true).open(writer_path)?;
+            connected.send(()).expect("test waits for FIFO connection");
+            assert!(blocked.recv().is_err(), "sender drop releases IPC bytes");
+            output.write_all(&ipc)
+        });
+        let mut stream = manager.read_spill_as_stream_unbuffered(file, None)?;
+        assert!(futures::poll!(stream.next()).is_pending());
+        ready.await.expect("writer connected to the active reader");
+        drop(stream);
+        assert_eq!(env.disk_manager.used_disk_space(), bytes);
+        assert!(
+            path.exists(),
+            "the active task must retain its file after cancellation"
+        );
+        drop(release);
+        writer.await.expect("IPC writer finished")?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while env.disk_manager.used_disk_space() != 0 || path.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("finished cancelled read must release its file and disk charge");
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_queued_spill_read_releases_disk_charge() -> Result<()> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()?
+            .block_on(async {
+                for consumed in [0, 1] {
+                    let batch = RecordBatch::try_from_iter([(
+                        "id",
+                        Arc::new(Int32Array::from_iter_values(0..256)) as ArrayRef,
+                    )])?;
+                    let env = Arc::new(RuntimeEnv::default());
+                    let manager = SpillManager::new(
+                        Arc::clone(&env),
+                        SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+                        batch.schema(),
+                    );
+                    let file = manager
+                        .spill_record_batch_and_finish(
+                            &[batch.clone(), batch.clone()],
+                            "queued cancellation",
+                        )?
+                        .expect("nonempty input");
+                    let path = file.path().to_owned();
+                    let bytes = env.disk_manager.used_disk_space();
+                    let mut stream =
+                        manager.read_spill_as_stream_unbuffered(file, None)?;
+                    for _ in 0..consumed {
+                        assert_eq!(stream.next().await.transpose()?, Some(batch.clone()));
+                    }
+
+                    // Occupy the only blocking worker before the real stream queues its read.
+                    let (started, ready) = tokio::sync::oneshot::channel();
+                    let (release, blocked) = std::sync::mpsc::channel::<()>();
+                    let worker = SpawnedTask::spawn_blocking(move || {
+                        started.send(()).expect("test waits for worker startup");
+                        assert!(
+                            blocked.recv().is_err(),
+                            "sender drop releases the worker"
+                        );
+                    });
+                    ready.await.expect("worker started");
+                    assert!(futures::poll!(stream.next()).is_pending());
+                    assert_eq!(env.disk_manager.used_disk_space(), bytes);
+                    assert!(path.exists());
+                    drop(stream);
+                    drop(release);
+                    worker.await.expect("blocking worker finished");
+                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        while env.disk_manager.used_disk_space() != 0 || path.exists() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect(
+                        "cancelled queued read must release its file and disk charge",
+                    );
+                }
+                Ok(())
+            })
+    }
 
     #[tokio::test]
     async fn test_batch_spill_and_read() -> Result<()> {

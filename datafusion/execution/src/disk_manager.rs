@@ -416,6 +416,10 @@ impl RefCountedTempFile {
             .used_disk_space
             .fetch_add(new_disk_usage, Ordering::Relaxed);
 
+        // Keep the file charge consistent even when the quota check rejects this growth.
+        self.current_file_disk_usage
+            .store(new_disk_usage, Ordering::Relaxed);
+
         // 3. Check if the updated global disk usage exceeds the configured limit
         let global_disk_usage = self.disk_manager.used_disk_space.load(Ordering::Relaxed);
         if global_disk_usage > self.disk_manager.max_temp_directory_size {
@@ -425,10 +429,6 @@ impl RefCountedTempFile {
                 human_readable_size(self.disk_manager.max_temp_directory_size as usize)
             );
         }
-
-        // 4. Update the local file size tracking
-        self.current_file_disk_usage
-            .store(new_disk_usage, Ordering::Relaxed);
 
         Ok(())
     }
@@ -646,6 +646,43 @@ mod tests {
         // Disk usage should return to 0
         assert_eq!(dm.used_disk_space(), 0);
 
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_disk_growth_releases_charge_and_allows_later_spill() -> Result<()> {
+        for initial_bytes in [0, 3] {
+            let dm = Arc::new(
+                DiskManagerBuilder::default()
+                    .with_max_temp_directory_size(4)
+                    .build()?,
+            );
+            let mut file = dm.create_tmp_file("quota rejection")?;
+            let path = file.path().to_owned();
+            file.inner().as_file().set_len(initial_bytes)?;
+            file.update_disk_usage()?;
+            file.inner().as_file().set_len(5)?;
+            for _ in 0..2 {
+                assert!(matches!(
+                    file.update_disk_usage(),
+                    Err(DataFusionError::ResourcesExhausted(_))
+                ));
+            }
+            drop(file);
+            assert!(!path.exists());
+            assert_eq!(
+                dm.used_disk_space(),
+                0,
+                "rejected growth must not leak quota"
+            );
+
+            let mut next = dm.create_tmp_file("later spill")?;
+            next.inner().as_file().set_len(4)?;
+            next.update_disk_usage()?;
+            assert_eq!(dm.used_disk_space(), 4);
+            drop(next);
+            assert_eq!(dm.used_disk_space(), 0);
+        }
         Ok(())
     }
 

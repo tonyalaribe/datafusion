@@ -1503,7 +1503,7 @@ mod tests {
         let batch = create_test_batch(0, ROWS_PER_BATCH);
         let batch_size = batch.get_array_memory_size();
 
-        // Step 2: Configure file rotation to approximately 1 batch per file
+        // Step 2: Rotate after each batch; rotation uses size > limit.
         // Create a custom RuntimeEnv so we can access the DiskManager
         let runtime = Arc::new(RuntimeEnvBuilder::default().build()?);
         let disk_manager = Arc::clone(&runtime.disk_manager);
@@ -1512,9 +1512,9 @@ mod tests {
         let schema = create_test_schema();
         let spill_manager = Arc::new(SpillManager::new(runtime, metrics.clone(), schema));
 
-        let (writer, mut reader) = channel(batch_size, spill_manager);
+        let (writer, mut reader) = channel(batch_size - 1, spill_manager);
 
-        // Step 3: Write NUM_BATCHES batches to create approximately NUM_BATCHES files
+        // Step 3: Write NUM_BATCHES batches into NUM_BATCHES files.
         for i in 0..NUM_BATCHES {
             let start = (i * ROWS_PER_BATCH) as i32;
             writer.push_batch(&create_test_batch(start, ROWS_PER_BATCH))?;
@@ -1523,10 +1523,8 @@ mod tests {
         // Check how many files were created (should be at least a few due to file rotation)
         let file_count = metrics.spill_file_count.value();
         assert_eq!(
-            file_count,
-            NUM_BATCHES - 1,
-            "Expected at {} files with rotation, got {file_count}",
-            NUM_BATCHES - 1
+            file_count, NUM_BATCHES,
+            "Expected {NUM_BATCHES} files with rotation, got {file_count}"
         );
 
         // Step 4: Verify initial disk usage reflects all files
