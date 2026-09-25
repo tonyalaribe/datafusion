@@ -27,7 +27,6 @@ use super::metrics::ExecutionPlanMetricsSet;
 use super::metrics::{BaselineMetrics, SplitMetrics};
 use super::{ExecutionPlan, RecordBatchStream, SendableRecordBatchStream};
 use crate::displayable;
-use crate::spill::get_record_batch_memory_size;
 
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use datafusion_common::{Result, exec_err};
@@ -746,68 +745,54 @@ impl RecordBatchStream for BatchSplitStream {
     }
 }
 
-/// A stream that holds a memory reservation for its lifetime,
-/// shrinking the reservation as batches are consumed.
-/// The original reservation must have its batch sizes calculated using [`get_record_batch_memory_size`]
-/// On error, the reservation is *NOT* freed, until the stream is dropped.
-pub(crate) struct ReservationStream {
+/// An in-memory batch sequence that reserves shared buffers only once.
+/// A buffer stays reserved until the last queued batch referencing it is emitted.
+pub(crate) struct ReservedBatchesStream {
     schema: SchemaRef,
-    inner: SendableRecordBatchStream,
+    batches: std::vec::IntoIter<(RecordBatch, usize)>,
     reservation: MemoryReservation,
 }
 
-impl ReservationStream {
-    pub(crate) fn new(
+impl ReservedBatchesStream {
+    pub(crate) fn try_new(
         schema: SchemaRef,
-        inner: SendableRecordBatchStream,
+        batches: Vec<RecordBatch>,
         reservation: MemoryReservation,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let releases =
+            datafusion_common::utils::memory::get_record_batch_memory_releases(&batches);
+        reservation.try_resize(releases.iter().sum())?;
+        Ok(Self {
             schema,
-            inner,
+            batches: batches
+                .into_iter()
+                .zip(releases)
+                .collect::<Vec<_>>()
+                .into_iter(),
             reservation,
-        }
+        })
     }
 }
 
-impl Stream for ReservationStream {
+impl Stream for ReservedBatchesStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(
         mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        _cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        let res = self.inner.poll_next_unpin(cx);
-
-        match res {
-            Poll::Ready(res) => {
-                match res {
-                    Some(Ok(batch)) => {
-                        self.reservation
-                            .shrink(get_record_batch_memory_size(&batch));
-                        Poll::Ready(Some(Ok(batch)))
-                    }
-                    Some(Err(err)) => Poll::Ready(Some(Err(err))),
-                    None => {
-                        // Stream is done so free the reservation completely
-                        self.reservation.free();
-                        // Release the input pipeline's resources.
-                        let inner_schema = self.inner.schema();
-                        self.inner = Box::pin(EmptyRecordBatchStream::new(inner_schema));
-                        Poll::Ready(None)
-                    }
-                }
-            }
-            Poll::Pending => Poll::Pending,
-        }
+        Poll::Ready(self.batches.next().map(|(batch, released)| {
+            self.reservation.shrink(released);
+            Ok(batch)
+        }))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
+        self.batches.size_hint()
     }
 }
 
-impl RecordBatchStream for ReservationStream {
+impl RecordBatchStream for ReservedBatchesStream {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -816,6 +801,7 @@ impl RecordBatchStream for ReservationStream {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::spill::get_record_batch_memory_size;
     use crate::test::exec::{
         BlockingExec, MockExec, PanicExec, assert_strong_count_converges_to_zero,
     };
@@ -1077,13 +1063,12 @@ mod test {
         let initial_reserved = runtime.memory_pool.reserved();
         assert_eq!(initial_reserved, batch1_size + batch2_size);
 
-        // Create stream with batches
-        let stream = futures::stream::iter(vec![Ok(batch1), Ok(batch2)]);
-        let inner = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), stream))
-            as SendableRecordBatchStream;
-
-        let mut res_stream =
-            ReservationStream::new(Arc::clone(&schema), inner, reservation);
+        let mut res_stream = ReservedBatchesStream::try_new(
+            Arc::clone(&schema),
+            vec![batch1, batch2],
+            reservation,
+        )
+        .unwrap();
 
         // Poll first batch
         let result1 = res_stream.next().await;
@@ -1109,55 +1094,25 @@ mod test {
         assert_eq!(runtime.memory_pool.reserved(), 0);
     }
 
-    #[tokio::test]
-    async fn test_reservation_stream_error_handling() {
-        use datafusion_execution::memory_pool::MemoryConsumer;
-        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+    #[test]
+    fn test_reserved_batches_stream_releases_on_construction_failure() {
+        use arrow::array::Int32Array;
+        use datafusion_execution::memory_pool::{
+            GreedyMemoryPool, MemoryConsumer, MemoryPool,
+        };
 
-        let runtime = RuntimeEnvBuilder::new()
-            .with_memory_limit(10 * 1024 * 1024, 1.0)
-            .build_arc()
-            .unwrap();
-
-        let reservation = MemoryConsumer::new("test").register(&runtime.memory_pool);
-
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-
-        reservation.try_grow(1000).unwrap();
-        let initial = runtime.memory_pool.reserved();
-        assert_eq!(initial, 1000);
-
-        // Create a stream that errors
-        let stream = futures::stream::iter(vec![exec_err!("Test error")]);
-        let inner = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), stream))
-            as SendableRecordBatchStream;
-
-        let mut res_stream =
-            ReservationStream::new(Arc::clone(&schema), inner, reservation);
-
-        // Get the error
-        let result = res_stream.next().await;
-        assert!(result.is_some());
-        assert!(result.unwrap().is_err());
-
-        // Verify reservation is NOT automatically freed on error
-        // The reservation is only freed when poll_next returns Poll::Ready(None)
-        // After an error, the stream may continue to hold the reservation
-        // until it's explicitly dropped or polled to None
-        let after_error = runtime.memory_pool.reserved();
-        assert_eq!(
-            after_error, 1000,
-            "Reservation should still be held after error"
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(16));
+        let reservation = MemoryConsumer::new("test").register(&pool);
+        reservation.try_grow(8).unwrap();
+        let batch = RecordBatch::try_from_iter(vec![(
+            "a",
+            Arc::new(Int32Array::from(vec![0; 16])) as arrow::array::ArrayRef,
+        )])
+        .unwrap();
+        assert!(
+            ReservedBatchesStream::try_new(batch.schema(), vec![batch], reservation)
+                .is_err()
         );
-
-        // Drop the stream to free the reservation
-        drop(res_stream);
-
-        // Now memory should be freed
-        assert_eq!(
-            runtime.memory_pool.reserved(),
-            0,
-            "Memory should be freed when stream is dropped"
-        );
+        assert_eq!(pool.reserved(), 0);
     }
 }

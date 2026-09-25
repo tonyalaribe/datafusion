@@ -314,6 +314,8 @@ pub struct ParquetSource {
     /// Sort order driving `PreparedAccessPlan::reorder_by_statistics`
     /// in the opener.
     sort_order_for_reorder: Option<LexOrdering>,
+    /// Whether files may be split into byte ranges for parallel scans.
+    allow_repartitioning: bool,
 }
 
 impl ParquetSource {
@@ -340,7 +342,19 @@ impl ParquetSource {
             encryption_factory: None,
             reverse_row_groups: false,
             sort_order_for_reorder: None,
+            allow_repartitioning: true,
         }
+    }
+
+    /// Control whether this source supports splitting files into byte ranges.
+    ///
+    /// Disable this when a consumer assigns physical row positions from the
+    /// scan stream. Combining independently scanned ranges does not preserve
+    /// their original row order. This does not disable scanning separate files
+    /// in parallel or change predicate pushdown behavior.
+    pub fn with_repartitioning(mut self, allow_repartitioning: bool) -> Self {
+        self.allow_repartitioning = allow_repartitioning;
+        self
     }
 
     /// Set the `TableParquetOptions` for this ParquetSource.
@@ -557,6 +571,10 @@ impl From<ParquetSource> for Arc<dyn FileSource> {
 }
 
 impl FileSource for ParquetSource {
+    fn supports_repartitioning(&self) -> bool {
+        self.allow_repartitioning
+    }
+
     fn create_file_opener(
         &self,
         _object_store: Arc<dyn ObjectStore>,
@@ -1271,6 +1289,35 @@ mod tests {
     use super::*;
     use arrow::datatypes::Schema;
     use datafusion_physical_expr::expressions::lit;
+
+    #[test]
+    fn positional_scans_can_disable_file_splitting() -> datafusion_common::Result<()> {
+        use datafusion_datasource::PartitionedFile;
+        use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+        use datafusion_execution::object_store::ObjectStoreUrl;
+
+        let source = ParquetSource::new(Arc::new(Schema::empty()));
+        assert!(
+            source.supports_repartitioning(),
+            "ordinary scans remain parallel"
+        );
+        for allowed in [false, true] {
+            let source = Arc::new(source.clone().with_repartitioning(allowed));
+            let config = FileScanConfigBuilder::new(
+                ObjectStoreUrl::local_filesystem(),
+                source.clone(),
+            )
+            .with_file(PartitionedFile::new("positional.parquet", 1024 * 1024))
+            .build();
+            let repartitioned = source.repartitioned(4, 1, None, &config)?;
+            assert_eq!(repartitioned.is_some(), allowed);
+            if let Some(repartitioned) = repartitioned {
+                assert_eq!(repartitioned.file_groups.len(), 4);
+            }
+            assert_eq!(config.file_groups.len(), 1, "original scan is unchanged");
+        }
+        Ok(())
+    }
 
     #[test]
     #[expect(deprecated)]

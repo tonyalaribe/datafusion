@@ -21,6 +21,72 @@ use datafusion_common::assert_contains;
 use tempfile::TempDir;
 
 #[tokio::test]
+async fn deallocate_all_preserves_session_state_and_quoted_names() {
+    let ctx = SessionContext::new();
+    let peer = SessionContext::new();
+    peer.sql("PREPARE kept AS SELECT 1").await.unwrap();
+    for sql in [
+        "SET datafusion.execution.batch_size = 17",
+        "PREPARE kept AS SELECT 1",
+        r#"PREPARE "all" AS SELECT 2"#,
+        r#"DEALLOCATE "all""#,
+        "EXECUTE kept",
+        r#"PREPARE "all" AS SELECT 2"#,
+        "DEALLOCATE ALL",
+        "DEALLOCATE PREPARE ALL",
+    ] {
+        ctx.sql(sql).await.unwrap();
+    }
+    for sql in ["EXECUTE kept", r#"EXECUTE "all""#] {
+        assert_contains!(
+            ctx.sql(sql).await.unwrap_err().to_string(),
+            "does not exist"
+        );
+    }
+    assert_eq!(ctx.state().config().batch_size(), 17);
+    peer.sql("EXECUTE kept").await.unwrap();
+}
+
+#[tokio::test]
+async fn correlated_cross_unnest_preserves_rows_and_null_elements()
+-> datafusion_common::Result<()> {
+    use datafusion::arrow::array::AsArray;
+    use datafusion::arrow::datatypes::Int64Type;
+
+    let ctx = SessionContext::new();
+    let batches = ctx
+        .sql(
+            "SELECT u.id, t.element
+         FROM (VALUES (1, [10, 20]), (2, [30, NULL]), (3, []), (4, NULL)) AS u(id, items)
+         CROSS JOIN UNNEST(u.items) AS t(element)
+         ORDER BY u.id, t.element NULLS LAST",
+        )
+        .await?
+        .collect()
+        .await?;
+    let rows: Vec<_> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_primitive::<Int64Type>()
+                .iter()
+                .zip(batch.column(1).as_primitive::<Int64Type>().iter())
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (Some(1), Some(10)),
+            (Some(1), Some(20)),
+            (Some(2), Some(30)),
+            (Some(2), None)
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_window_function() {
     let ctx = SessionContext::new();
     let df = ctx

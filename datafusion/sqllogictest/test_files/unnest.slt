@@ -894,6 +894,19 @@ select count(*) from (select unnest(range(0, 100000)) id) t inner join (select u
 query error DataFusion error: This feature is not implemented: Physical plan does not support logical expression OuterReferenceColumn\(Field \{ name: "column1", data_type: List\(Field \{ data_type: Int64, nullable: true \}\), nullable: true \}, Column \{ relation: Some\(Bare \{ table: "u" \}\), name: "column1" \}\)
 select * from unnest_table u, unnest(u.column1);
 
+# A directly joined UNNEST of a left-side list column uses native row expansion.
+query II rowsort
+select u.column3, t.element
+from unnest_table u cross join unnest(u.column1) as t(element);
+----
+1 1
+1 2
+1 3
+2 4
+2 5
+3 6
+NULL 12
+
 # Test implicit LATERAL support for UNNEST (INNER JOIN)
 query error DataFusion error: This feature is not implemented: Physical plan does not support logical expression OuterReferenceColumn\(Field \{ name: "column1", data_type: List\(Field \{ data_type: Int64, nullable: true \}\), nullable: true \}, Column \{ relation: Some\(Bare \{ table: "u" \}\), name: "column1" \}\)
 select * from unnest_table u INNER JOIN unnest(u.column1) AS t(column1) ON u.column3 = t.column1;

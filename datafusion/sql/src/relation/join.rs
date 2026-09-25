@@ -16,8 +16,10 @@
 // under the License.
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
-use datafusion_common::{Column, Result, not_impl_err, plan_datafusion_err};
-use datafusion_expr::{JoinType, LogicalPlan, LogicalPlanBuilder};
+use datafusion_common::{
+    Column, Result, TableReference, not_impl_err, plan_datafusion_err,
+};
+use datafusion_expr::{Expr, JoinType, LogicalPlan, LogicalPlanBuilder, expr::Unnest};
 use sqlparser::ast::{
     Join, JoinConstraint, JoinOperator, ObjectName, TableFactor, TableWithJoins,
 };
@@ -49,6 +51,41 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         join: Join,
         planner_context: &mut PlannerContext,
     ) -> Result<LogicalPlan> {
+        if let Join {
+            relation:
+                TableFactor::UNNEST {
+                    alias: Some(alias),
+                    array_exprs,
+                    with_offset: false,
+                    with_offset_alias: None,
+                    with_ordinality: false,
+                },
+            join_operator: JoinOperator::CrossJoin(JoinConstraint::None),
+            ..
+        } = &join
+            && let [array_expr] = array_exprs.as_slice()
+            && let [column_alias] = alias.columns.as_slice()
+        {
+            let array_expr =
+                self.sql_to_expr(array_expr.clone(), left.schema(), planner_context)?;
+            if matches!(array_expr, Expr::Column(_)) {
+                let mut select_exprs = left
+                    .schema()
+                    .iter()
+                    .map(|(qualifier, field)| {
+                        Expr::Column(Column::new(qualifier.cloned(), field.name()))
+                    })
+                    .collect::<Vec<_>>();
+                select_exprs.push(Expr::Unnest(Unnest::new(array_expr)).alias_qualified(
+                    Some(TableReference::bare(
+                        self.ident_normalizer.normalize(alias.name.clone()),
+                    )),
+                    self.ident_normalizer.normalize(column_alias.name.clone()),
+                ));
+                return self.try_process_unnest(left, select_exprs);
+            }
+        }
+
         let right = if is_lateral_join(&join)? {
             self.create_relation_subquery(join.relation, planner_context)?
         } else {

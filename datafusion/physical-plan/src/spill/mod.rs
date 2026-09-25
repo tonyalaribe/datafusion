@@ -62,9 +62,12 @@ use log::debug;
 /// for the file's lifetime, avoiding deadlocks when concurrent reads exceed thread pool limits.
 struct SpillReaderStream {
     schema: SchemaRef,
+    reader: Option<ActiveSpillReader>,
+}
+
+struct ActiveSpillReader {
     decoder: StreamDecoder,
     byte_stream: Pin<Box<dyn Stream<Item = Result<bytes::Bytes>> + Send>>,
-    is_done: bool,
 
     /// Maximum memory size observed among spilling sorted record batches.
     /// This is used for validation purposes during reading each RecordBatch from spill.
@@ -75,7 +78,7 @@ struct SpillReaderStream {
     /// Holds leftover bytes from a chunk when a batch is yielded early
     current_buffer: Buffer,
 
-    /// Keeps the file alive until the stream is dropped
+    /// Drops after the byte stream closes, including on EOF and read errors.
     _spill_file: Arc<dyn SpillFile>,
 
     schema_validated: bool,
@@ -96,13 +99,14 @@ impl SpillReaderStream {
         let decoder = unsafe { StreamDecoder::new().with_skip_validation(true) };
         Ok(Self {
             schema,
-            decoder,
-            byte_stream,
-            max_record_batch_memory,
-            is_done: false,
-            current_buffer: Buffer::from(&[]),
-            _spill_file: spill_file,
-            schema_validated: false,
+            reader: Some(ActiveSpillReader {
+                decoder,
+                byte_stream,
+                max_record_batch_memory,
+                current_buffer: Buffer::from(&[]),
+                _spill_file: spill_file,
+                schema_validated: false,
+            }),
         })
     }
 }
@@ -112,11 +116,24 @@ impl Stream for SpillReaderStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-
-        if this.is_done {
+        let Some(reader) = &mut this.reader else {
             return Poll::Ready(None);
+        };
+        let result = reader.poll_next_inner(&this.schema, cx);
+        if matches!(result, Poll::Ready(None | Some(Err(_)))) {
+            this.reader = None;
         }
+        result
+    }
+}
 
+impl ActiveSpillReader {
+    fn poll_next_inner(
+        &mut self,
+        schema: &SchemaRef,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<RecordBatch>>> {
+        let this = self;
         loop {
             if !this.current_buffer.is_empty() {
                 match this.decoder.decode(&mut this.current_buffer) {
@@ -129,14 +146,13 @@ impl Stream for SpillReaderStream {
                         if !this.schema_validated {
                             this.schema_validated = true;
                             let actual = batch.schema();
-                            if actual != this.schema {
-                                this.is_done = true;
+                            if actual != *schema {
                                 return Poll::Ready(Some(Err(
                                     datafusion_common::exec_datafusion_err!(
                                         "Spill file schema mismatch: expected {}, got {}. \
                      The caller must use the same SpillManager that created \
                      the spill file to read it.",
-                                        this.schema,
+                                        schema,
                                         actual
                                     ),
                                 )));
@@ -164,7 +180,6 @@ impl Stream for SpillReaderStream {
                         // We do nothing and fall through to fetch more data.
                     }
                     Err(e) => {
-                        this.is_done = true;
                         return Poll::Ready(Some(Err(e.into())));
                     }
                 }
@@ -175,12 +190,9 @@ impl Stream for SpillReaderStream {
                     this.current_buffer = Buffer::from(chunk);
                 }
                 Some(Err(e)) => {
-                    this.is_done = true;
                     return Poll::Ready(Some(Err(e)));
                 }
                 None => {
-                    this.is_done = true;
-
                     if let Err(e) = this.decoder.finish() {
                         return Poll::Ready(Some(Err(e.into())));
                     }
@@ -546,6 +558,80 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use datafusion_execution::runtime_env::RuntimeEnv;
     use futures::StreamExt as _;
+
+    #[tokio::test]
+    async fn spill_reader_retains_disk_charge_until_closed() -> Result<()> {
+        enum Finish {
+            Cancel,
+            Eof,
+            SchemaMismatch,
+        }
+        let batch = RecordBatch::try_from_iter([(
+            "id",
+            Arc::new(Int32Array::from_iter_values(0..256)) as ArrayRef,
+        )])?;
+        let env = Arc::new(RuntimeEnv::default());
+        let manager = SpillManager::new(
+            Arc::clone(&env),
+            SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+            batch.schema(),
+        );
+        let mismatched = SpillManager::new(
+            Arc::clone(&env),
+            SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+            Arc::new(Schema::empty()),
+        );
+        for finish in [Finish::Cancel, Finish::Eof, Finish::SchemaMismatch] {
+            let file = manager
+                .spill_record_batch_and_finish(
+                    &[batch.clone(), batch.clone()],
+                    "reader lifetime",
+                )?
+                .expect("nonempty input");
+            let path = file.path().expect("local spill file").to_owned();
+            let bytes = env.disk_manager.used_disk_space();
+            assert!(bytes > 0);
+            let reader = if matches!(finish, Finish::SchemaMismatch) {
+                &mismatched
+            } else {
+                &manager
+            };
+            let mut stream = reader.read_spill_as_stream_unbuffered(file, None)?;
+            if matches!(finish, Finish::SchemaMismatch) {
+                let error = stream.next().await.expect("schema mismatch must fail");
+                assert!(
+                    matches!(error, Err(datafusion_common::DataFusionError::Execution(message)) if message.starts_with("Spill file schema mismatch:"))
+                );
+                assert_eq!(env.disk_manager.used_disk_space(), 0);
+                assert!(
+                    !path.exists(),
+                    "read error must close the file before stream drop"
+                );
+                assert!(
+                    stream.next().await.is_none(),
+                    "read error must terminate the stream"
+                );
+                continue;
+            }
+            assert_eq!(stream.next().await.transpose()?, Some(batch.clone()));
+            assert_eq!(env.disk_manager.used_disk_space(), bytes);
+            assert!(path.exists(), "the open reader must own the spill file");
+            if matches!(finish, Finish::Eof) {
+                assert_eq!(stream.next().await.transpose()?, Some(batch.clone()));
+                assert_eq!(env.disk_manager.used_disk_space(), bytes);
+                assert!(stream.next().await.is_none());
+                assert_eq!(env.disk_manager.used_disk_space(), 0);
+                assert!(!path.exists(), "EOF must close the file before stream drop");
+            }
+            drop(stream);
+            assert_eq!(env.disk_manager.used_disk_space(), 0);
+            assert!(
+                !path.exists(),
+                "completion and cancellation must delete the spill file"
+            );
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_batch_spill_and_read() -> Result<()> {

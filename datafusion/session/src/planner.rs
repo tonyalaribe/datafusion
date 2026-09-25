@@ -32,6 +32,12 @@ use crate::Session;
 /// A planner that creates a physical plan for a query.
 #[async_trait]
 pub trait QueryPlanner: Any + Debug {
+    /// Whether this planner implements `UPDATE ... FROM`, including source-side
+    /// predicates and assignments. The default physical planner does not.
+    fn supports_update_from(&self) -> bool {
+        false
+    }
+
     /// Given a [`LogicalPlan`], create an [`ExecutionPlan`] suitable for execution
     async fn create_physical_plan(
         &self,
