@@ -161,6 +161,18 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             Some(base_plan.schema().as_ref()),
         )?;
         let order_by_rex = normalize_sorts(order_by_rex, &projected_plan)?;
+        // Aggregate arguments refer to input columns, even when a SELECT alias
+        // shadows the same name. Keep direct output-alias ordering unchanged.
+        let order_by_rex = order_by_rex
+            .into_iter()
+            .map(|sort| {
+                if find_aggregate_exprs([&sort.expr]).is_empty() {
+                    Ok(sort)
+                } else {
+                    Ok(sort.with_expr(resolve_columns(&sort.expr, &base_plan)?))
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         // This alias map is resolved and looked up in both having exprs and group by exprs
         let alias_map = extract_aliases(&select_exprs);

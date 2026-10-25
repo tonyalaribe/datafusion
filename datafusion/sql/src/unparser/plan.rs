@@ -555,13 +555,16 @@ impl Unparser<'_> {
         // Generate the alias up front so that peel_to_unnest_with_modifiers
         // can rewrite ORDER BY placeholder columns to alias.VALUE.
         if self.dialect.unnest_as_lateral_flatten() && unnest_input_type.is_some() {
-            let flatten_alias_name = if !select.already_projected() {
-                select.next_flatten_alias()
-            } else {
-                select
-                    .current_flatten_alias()
-                    .unwrap_or_else(|| select.next_flatten_alias())
-            };
+            let flatten_alias_name =
+                if let Some(alias) = Self::projection_flatten_alias(p) {
+                    alias.table().to_string()
+                } else if !select.already_projected() {
+                    select.next_flatten_alias()
+                } else {
+                    select
+                        .current_flatten_alias()
+                        .unwrap_or_else(|| select.next_flatten_alias())
+                };
 
             if let Some((unnest, unnest_plan)) = self.peel_to_unnest_with_modifiers(
                 p.input.as_ref(),
@@ -1962,8 +1965,28 @@ impl Unparser<'_> {
         }
     }
 
+    fn projection_flatten_alias(projection: &Projection) -> Option<&TableReference> {
+        projection.expr.iter().find_map(|expr| match expr {
+            Expr::Alias(alias)
+                if Self::find_unnest_placeholder(&alias.expr).is_some() =>
+            {
+                alias.relation.as_ref()
+            }
+            _ => None,
+        })
+    }
+
     fn collect_flatten_aliases(plan: &LogicalPlan, select: &mut SelectBuilder) {
         match plan {
+            LogicalPlan::Projection(projection) => {
+                if let Some(alias) = Self::projection_flatten_alias(projection) {
+                    select.add_flatten_table_alias(alias.table().to_string());
+                }
+                Self::collect_flatten_aliases(&projection.input, select);
+            }
+            LogicalPlan::Unnest(unnest) => {
+                Self::collect_flatten_aliases(&unnest.input, select);
+            }
             LogicalPlan::SubqueryAlias(alias)
                 if Self::contains_unnest(alias.input.as_ref()) =>
             {
@@ -2039,11 +2062,14 @@ impl Unparser<'_> {
 
         // For now, handle the simple case of a single expression to flatten.
         // Multi-expression would require multiple LATERAL FLATTEN calls chained together.
-        let Some(first_expr) = projection.expr.first() else {
+        let Some((index, _)) = unnest.list_type_columns.first() else {
+            return Ok(None);
+        };
+        let Some(input) = projection.expr.get(*index) else {
             return Ok(None);
         };
 
-        let input_expr = self.expr_to_sql(first_expr)?;
+        let input_expr = self.expr_to_sql(input)?;
 
         let mut flatten = FlattenRelationBuilder::default();
         flatten.input_expr(input_expr);
