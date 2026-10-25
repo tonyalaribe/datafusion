@@ -1,0 +1,53 @@
+---
+source: datafusion/sql/tests/sql_integration.rs
+expression: "plans.join(\"\\n\\n\")"
+---
+cast_same_alias
+Projection: last_seen
+  Sort: max(audience_sessions.last_seen) DESC NULLS FIRST
+    Projection: CAST(max(audience_sessions.last_seen) AS Utf8View) AS last_seen, max(audience_sessions.last_seen)
+      Aggregate: groupBy=[[audience_sessions.user_id]], aggr=[[max(audience_sessions.last_seen)]]
+        SubqueryAlias: audience_sessions
+          Projection: Utf8("u1") AS user_id, CAST(Utf8("2026-10-25 12:00:00") AS Timestamp(ns)) AS last_seen
+            EmptyRelation: rows=1
+
+uncast_same_alias
+Sort: last_seen DESC NULLS FIRST
+  Projection: max(audience_sessions.last_seen) AS last_seen
+    Aggregate: groupBy=[[audience_sessions.user_id]], aggr=[[max(audience_sessions.last_seen)]]
+      SubqueryAlias: audience_sessions
+        Projection: Utf8("u1") AS user_id, CAST(Utf8("2026-10-25 12:00:00") AS Timestamp(ns)) AS last_seen
+          EmptyRelation: rows=1
+
+qualified_aggregate_order
+Projection: last_seen
+  Sort: max(audience_sessions.last_seen) DESC NULLS FIRST
+    Projection: CAST(max(audience_sessions.last_seen) AS Utf8View) AS last_seen, max(audience_sessions.last_seen)
+      Aggregate: groupBy=[[audience_sessions.user_id]], aggr=[[max(audience_sessions.last_seen)]]
+        SubqueryAlias: audience_sessions
+          Projection: Utf8("u1") AS user_id, CAST(Utf8("2026-10-25 12:00:00") AS Timestamp(ns)) AS last_seen
+            EmptyRelation: rows=1
+
+output_alias_order
+Sort: last_seen DESC NULLS FIRST
+  Projection: CAST(max(audience_sessions.last_seen) AS Utf8View) AS last_seen
+    Aggregate: groupBy=[[audience_sessions.user_id]], aggr=[[max(audience_sessions.last_seen)]]
+      SubqueryAlias: audience_sessions
+        Projection: Utf8("u1") AS user_id, CAST(Utf8("2026-10-25 12:00:00") AS Timestamp(ns)) AS last_seen
+          EmptyRelation: rows=1
+
+different_alias
+Projection: latest
+  Sort: max(audience_sessions.last_seen) DESC NULLS FIRST
+    Projection: CAST(max(audience_sessions.last_seen) AS Utf8View) AS latest, max(audience_sessions.last_seen)
+      Aggregate: groupBy=[[audience_sessions.user_id]], aggr=[[max(audience_sessions.last_seen)]]
+        SubqueryAlias: audience_sessions
+          Projection: Utf8("u1") AS user_id, CAST(Utf8("2026-10-25 12:00:00") AS Timestamp(ns)) AS last_seen
+            EmptyRelation: rows=1
+
+no_order
+Projection: CAST(max(audience_sessions.last_seen) AS Utf8View) AS last_seen
+  Aggregate: groupBy=[[audience_sessions.user_id]], aggr=[[max(audience_sessions.last_seen)]]
+    SubqueryAlias: audience_sessions
+      Projection: Utf8("u1") AS user_id, CAST(Utf8("2026-10-25 12:00:00") AS Timestamp(ns)) AS last_seen
+        EmptyRelation: rows=1

@@ -4450,6 +4450,55 @@ fn order_by_unaliased_name() {
 }
 
 #[test]
+fn order_by_aggregate_shadowed_by_select_alias() -> Result<()> {
+    let prefix = "WITH audience_sessions AS (SELECT 'u1' AS user_id, TIMESTAMP '2026-10-25 12:00:00' AS last_seen) ";
+    let cases = [
+        (
+            "cast_same_alias",
+            "SELECT MAX(last_seen)::TEXT AS last_seen FROM audience_sessions GROUP BY user_id ORDER BY MAX(last_seen) DESC",
+        ),
+        (
+            "uncast_same_alias",
+            "SELECT MAX(last_seen) AS last_seen FROM audience_sessions GROUP BY user_id ORDER BY MAX(last_seen) DESC",
+        ),
+        (
+            "qualified_aggregate_order",
+            "SELECT MAX(last_seen)::TEXT AS last_seen FROM audience_sessions GROUP BY user_id ORDER BY MAX(audience_sessions.last_seen) DESC",
+        ),
+        (
+            "output_alias_order",
+            "SELECT MAX(last_seen)::TEXT AS last_seen FROM audience_sessions GROUP BY user_id ORDER BY last_seen DESC",
+        ),
+        (
+            "different_alias",
+            "SELECT MAX(last_seen)::TEXT AS latest FROM audience_sessions GROUP BY user_id ORDER BY MAX(last_seen) DESC",
+        ),
+        (
+            "no_order",
+            "SELECT MAX(last_seen)::TEXT AS last_seen FROM audience_sessions GROUP BY user_id",
+        ),
+    ];
+    let plans = cases
+        .into_iter()
+        .map(|(name, suffix)| {
+            let plan = logical_plan(&format!("{prefix}{suffix}"))
+                .map_err(|error| error.context(name))?;
+            Ok(format!("{name}\n{}", plan.display_indent()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    assert_snapshot!(plans.join("\n\n"));
+    // Distinct casts still share aggregate field names; do not silently merge them.
+    let error = logical_plan(&format!(
+        "{prefix}SELECT MAX(last_seen::TEXT) AS latest_text FROM audience_sessions GROUP BY user_id ORDER BY MAX(audience_sessions.last_seen) DESC"
+    )).unwrap_err();
+    assert_snapshot!(
+        error.strip_backtrace(),
+        @r#"Schema error: Schema contains duplicate unqualified field name "max(audience_sessions.last_seen)""#
+    );
+    Ok(())
+}
+
+#[test]
 fn order_by_ambiguous_name() {
     let sql = "select * from person a join person b using (id) order by age";
     let err = logical_plan(sql).unwrap_err().strip_backtrace();
