@@ -16,9 +16,10 @@
 // under the License.
 
 use crate::spill::get_record_batch_memory_size;
-use arrow::array::ArrayRef;
+use arrow::array::{Array, ArrayRef, AsArray, BooleanArray};
+use arrow::buffer::{BooleanBuffer, NullBuffer};
 use arrow::compute::interleave;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{DataFusionError, Result};
@@ -141,6 +142,9 @@ impl BatchBuilder {
                     .iter()
                     .map(|(_, batch)| batch.column(column_idx).as_ref())
                     .collect();
+                if arrays[0].data_type() == &DataType::Boolean {
+                    return Ok(interleave_boolean(&arrays, indices));
+                }
                 // Arrow 58.1.0+ returns OffsetOverflowError directly from
                 // interleave, allowing retry_interleave to shrink the batch.
                 interleave(&arrays, indices).map_err(Into::into)
@@ -274,8 +278,57 @@ where
     }
 }
 
+/// `interleave` for Boolean columns, which arrow routes through its generic
+/// `MutableArrayData` fallback: one `extend` per run, and a merge's runs are
+/// mostly a single row.
+fn interleave_boolean(arrays: &[&dyn Array], indices: &[(usize, usize)]) -> ArrayRef {
+    let arrays: Vec<&BooleanArray> =
+        arrays.iter().map(|array| array.as_boolean()).collect();
+    let values = BooleanBuffer::collect_bool(indices.len(), |i| {
+        let (array, row) = indices[i];
+        arrays[array].value(row)
+    });
+    let nulls = arrays.iter().any(|array| array.null_count() > 0).then(|| {
+        NullBuffer::new(BooleanBuffer::collect_bool(indices.len(), |i| {
+            let (array, row) = indices[i];
+            arrays[array].is_valid(row)
+        }))
+    });
+    Arc::new(BooleanArray::new(values, nulls))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn interleave_boolean_matches_arrow_interleave() {
+        use arrow::array::BooleanArray;
+        let a = BooleanArray::from(vec![Some(true), None, Some(false), Some(true)]);
+        let b = BooleanArray::from(vec![Some(false), Some(true), None]);
+        let arrays: Vec<&dyn Array> = vec![&a, &b];
+        let indices = [
+            (0, 0),
+            (1, 2),
+            (0, 1),
+            (1, 0),
+            (0, 3),
+            (0, 2),
+            (1, 1),
+            (0, 0),
+        ];
+        let expected = interleave(&arrays, &indices).unwrap();
+        assert_eq!(
+            interleave_boolean(&arrays, &indices).as_ref(),
+            expected.as_ref()
+        );
+        let no_nulls = BooleanArray::from(vec![true, false]);
+        let arrays: Vec<&dyn Array> = vec![&no_nulls, &no_nulls];
+        let indices = [(1, 1), (0, 0), (0, 1)];
+        assert_eq!(
+            interleave_boolean(&arrays, &indices).as_ref(),
+            interleave(&arrays, &indices).unwrap().as_ref()
+        );
+    }
+
     use super::*;
     use arrow::array::{Array, ArrayDataBuilder, Int32Array, ListArray};
     use arrow::buffer::Buffer;
